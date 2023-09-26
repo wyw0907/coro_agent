@@ -8,7 +8,6 @@ from abc import abstractmethod
 from pathlib import Path
 from typing import (
     Any,
-    Callable,
     Dict,
     List,
     Optional,
@@ -17,7 +16,6 @@ from typing import (
     Union,
 )
 
-from langchain.agents.agent_iterator import AgentExecutorIterator
 from langchain.agents.agent_types import AgentType
 from langchain.agents.tools import InvalidTool
 from langchain.callbacks.base import BaseCallbackManager
@@ -37,6 +35,8 @@ from langchain.utils.input import get_color_mapping
 from langchain.agents.agent import ExceptionTool, AgentExecutor
 from langchain.load.serializable import Serializable
 
+from coro_agent.coro_tools import StructuredToolWithCtx
+
 logger = logging.getLogger(__name__)
 
 class CoroAgentSuspend(Serializable):
@@ -45,6 +45,10 @@ class CoroAgentSuspend(Serializable):
         
 
 class CoroAgentExecutor(AgentExecutor):
+
+    tool_execute_context: dict = None
+    """If you need to run a tool with a context, 
+    you have the option to set this context and it's key"""
 
     _coro_status: Dict[str, Any] = {}
 
@@ -138,7 +142,7 @@ class CoroAgentExecutor(AgentExecutor):
             return output, None
         
         if not isinstance(output, AgentAction):
-            raise ValueError('coro agent is not support for multi action')
+            raise ValueError('CoroAgentExecutor is not support for multi action')
         
         agent_action: AgentAction = output
         
@@ -153,8 +157,18 @@ class CoroAgentExecutor(AgentExecutor):
             if return_direct:
                 tool_run_kwargs["llm_prefix"] = ""
             # We then call the tool on the tool input to get an observation
+            tool_input = agent_action.tool_input
+
+            if self.tool_execute_context and isinstance(tool, StructuredToolWithCtx):
+                arg_keys = [k for k in tool.args.keys() if k != tool.context_key]
+                if len(arg_keys) > 1:
+                    raise ValueError('CoroAgentExecutor is not support tool with multi parameters')
+                tool_input = {
+                    tool.context_key: self.tool_execute_context,
+                    arg_keys[0]:  agent_action.tool_input
+                }
             observation = tool.run(
-                agent_action.tool_input,
+                tool_input,
                 verbose=self.verbose,
                 color=color,
                 callbacks=run_manager.get_child() if run_manager else None,
