@@ -14,6 +14,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    Callable,
 )
 
 from langchain.agents.agent_types import AgentType
@@ -40,10 +41,11 @@ from coro_agent.coro_tools import StructuredToolWithCtx
 logger = logging.getLogger(__name__)
 
 class CoroAgentSuspend(Serializable):
-    
-    output:str = None,
+    output:str
+    '''The result of tool'''
+    callback: BaseTool
+    '''This tool calls the next input when it arrives.'''
         
-
 class CoroAgentExecutor(AgentExecutor):
 
     tool_execute_context: dict = None
@@ -159,20 +161,12 @@ class CoroAgentExecutor(AgentExecutor):
             # We then call the tool on the tool input to get an observation
             tool_input = agent_action.tool_input
 
-            if self.tool_execute_context and isinstance(tool, StructuredToolWithCtx):
-                arg_keys = [k for k in tool.args.keys() if k != tool.context_key]
-                if len(arg_keys) > 1:
-                    raise ValueError('CoroAgentExecutor is not support tool with multi parameters')
-                tool_input = {
-                    tool.context_key: self.tool_execute_context,
-                    arg_keys[0]:  agent_action.tool_input
-                }
-            observation = tool.run(
-                tool_input,
-                verbose=self.verbose,
-                color=color,
-                callbacks=run_manager.get_child() if run_manager else None,
-                **tool_run_kwargs,
+            observation = self._run_tool_with_ctx(
+                tool=tool, 
+                tool_input=tool_input, 
+                color=color, 
+                run_manager=run_manager, 
+                tool_run_kwargs = tool_run_kwargs
             )
         else:
             tool_run_kwargs = self.agent.tool_run_logging_kwargs()
@@ -187,6 +181,31 @@ class CoroAgentExecutor(AgentExecutor):
                 **tool_run_kwargs,
             )
         return agent_action, observation
+
+    def _run_tool_with_ctx(
+            self, 
+            tool: BaseTool, 
+            tool_input: Any, 
+            color = None, 
+            run_manager: Optional[CallbackManagerForChainRun] = None,
+            tool_run_kwargs:dict = None,
+        ):
+        if self.tool_execute_context and isinstance(tool, StructuredToolWithCtx):
+            arg_keys = [k for k in tool.args.keys() if k != tool.context_key]
+            if len(arg_keys) > 1:
+                raise ValueError('CoroAgentExecutor is not support tool with multi parameters')
+            tool_input = {
+                tool.context_key: self.tool_execute_context,
+                arg_keys[0]: tool_input
+            }
+        observation = tool.run(
+            tool_input,
+            verbose=self.verbose,
+            color=color,
+            callbacks=run_manager.get_child() if run_manager else None,
+            **tool_run_kwargs,
+        )
+        return observation
 
     async def _atake_next_step(
         self,
@@ -217,9 +236,17 @@ class CoroAgentExecutor(AgentExecutor):
         if self._coro_status:
             intermediate_steps.extend(self._coro_status['intermediate_steps'])
             if not 'input' in inputs:
-                raise ValueError('coroutine agent mast run with params `input`')
-            
-            intermediate_steps.append((self._coro_status['last_agent_action'], inputs['input']))
+                raise ValueError('coroutine agent must run with params `input`')
+
+            coro_next_observation = self._run_tool_with_ctx(
+                tool=self._coro_status['callback_tool'], 
+                tool_input=inputs['input'],
+                color='yellow',
+                run_manager=run_manager,
+                tool_run_kwargs=self.agent.tool_run_logging_kwargs()
+            )
+
+            intermediate_steps.append((self._coro_status['last_agent_action'], coro_next_observation))
         else:
             self._coro_status['agent_inputs'] = inputs
         
@@ -247,6 +274,9 @@ class CoroAgentExecutor(AgentExecutor):
             if isinstance(observation, CoroAgentSuspend):
                 self._coro_status['intermediate_steps'] = intermediate_steps
                 self._coro_status['last_agent_action'] = next_step_action
+                if not observation.callback or not observation.output:
+                    raise ValueError(f'CoroAgentSuspend `{observation}` is invalid')
+                self._coro_status['callback_tool'] = observation.callback
                 return { 
                     'output': observation.output
                 }
